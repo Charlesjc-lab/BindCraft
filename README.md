@@ -55,7 +55,33 @@ python -u ./bindcraft.py --settings './settings_target/PDL1.json' --filters './s
 
 **We recommend to generate at least a 100 final designs passing all filters, then order the top 5-20 for experimental characterisation.** If high affinity binders are required, it is better to screen more, as the ipTM metric used for ranking is not a good predictor for affinity, but has been shown to be a good binary predictor of binding. 
 
-Below are explanations for individual filters and advanced settings.
+### Peptide Evaluation Mode
+If you have a list of specific peptide sequences you want to evaluate against a target protein (instead of designing them from scratch), you can use the peptide evaluation mode. Provide a text file with one peptide sequence per line using the `--peptide_list_file` (or `-p`) argument:
+
+```
+python -u ./bindcraft.py --settings './settings_target/PDL1.json' \
+                         --filters './settings_filters/default_filters.json' \
+                         --advanced './settings_advanced/default_4stage_multimer.json' \
+                         --peptide_list_file './path/to/your_peptides.txt'
+```
+
+In this mode:
+- The script will bypass the binder hallucination and MPNN design steps.
+- It will iterate through each peptide sequence in your `your_peptides.txt` file.
+- For each peptide, it will predict the complex with the target protein, perform relaxation, calculate all standard metrics (AF2 scores, Rosetta interface scores, clashes, etc.), and apply the specified filters.
+- Output PDB files and CSV logs (`mpnn_design_stats.csv`, `final_design_stats.csv`) will be generated, similar to the design mode.
+- The `lengths` parameter in the target JSON file will be ignored; peptide length is taken directly from the input sequences.
+- Metrics like `Hotspot_RMSD` and `Binder_RMSD` (which are relative to an initial hallucinated trajectory) will be `None` or not applicable in the output CSVs for this mode, as no initial trajectory is generated for the input peptides.
+- For AF2 complex prediction in this mode, `predict_initial_guess` and `predict_bigbang` options from advanced settings are effectively turned off to simplify predictions when no specific initial structural guess for the peptide is available.
+
+Example `your_peptides.txt`:
+```
+PEPTIDESEQONE
+PEPTIDESEQTWO
+ANOTHERPEPTIDE
+```
+
+Below are explanations for individual filters and advanced settings (applicable to both modes unless specified).
 
 ## Advanced settings
 Here are the advanced settings controlling the design process:
