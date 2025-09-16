@@ -47,7 +47,22 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     # redefine intramolecular contacts (con) and intermolecular contacts (i_con) definitions
     af_model.opt["con"].update({"num":advanced_settings["intra_contact_number"],"cutoff":advanced_settings["intra_contact_distance"],"binary":False,"seqsep":9})
     af_model.opt["i_con"].update({"num":advanced_settings["inter_contact_number"],"cutoff":advanced_settings["inter_contact_distance"],"binary":False})
-        
+
+    if advanced_settings.get("use_cyclic_offset", False):
+        # inject cyclic positional encoding
+        binder_len = af_model._binder_len
+        target_len = af_model._target_len
+        idx = af_model._inputs['residue_index']
+        offset = idx[:, None] - idx[None, :]
+        i, j = np.indices((binder_len, binder_len))
+        rel_pos = i - j
+        cyclic_rel_pos = np.where(np.abs(rel_pos) > binder_len / 2, rel_pos - np.sign(rel_pos) * binder_len, rel_pos)
+        total_len = target_len + binder_len
+        offset_shape = (total_len, total_len)
+        binder_mask = np.zeros(offset_shape, dtype=bool)
+        binder_mask[target_len:, target_len:] = True
+        offset[binder_mask] = cyclic_rel_pos.flatten()
+        af_model._inputs["offset"] = offset
 
     ### additional loss functions
     if advanced_settings["use_rg_loss"]:
@@ -58,7 +73,10 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
         # interface pTM loss
         add_i_ptm_loss(af_model, advanced_settings["weights_iptm"])
 
-    if advanced_settings["use_termini_distance_loss"]:
+    if advanced_settings.get("use_cyclization_loss", False):
+        # geometric loss to encourage cyclization
+        add_cyclization_loss(af_model, weight=advanced_settings["weights_termini_loss"])
+    elif advanced_settings["use_termini_distance_loss"]:
         # termini distance loss
         add_termini_distance_loss(af_model, advanced_settings["weights_termini_loss"])
 
@@ -446,6 +464,67 @@ def add_termini_distance_loss(self, weight=0.1, threshold_distance=7.0):
     # Append the loss function to the model callbacks
     self._callbacks["model"]["loss"].append(loss_fn)
     self.opt["weights"]["NC"] = weight
+
+def add_cyclization_loss(self, weight=1.0,
+                         ideal_bond_length=1.33,
+                         ideal_angle_ca_c_n=116.0,
+                         ideal_angle_c_n_ca=122.0,
+                         ideal_dihedral=180.0):
+    '''Add loss to encourage cyclization via ideal peptide bond geometry'''
+    def loss_fn(inputs, outputs):
+        xyz = outputs["structure_module"]["final_atom_positions"]
+
+        # Get binder coordinates
+        binder_xyz = xyz[-self._binder_len:]
+
+        # Get specific atoms for the virtual bond
+        n_term_N = binder_xyz[0, residue_constants.atom_order["N"]]
+        n_term_CA = binder_xyz[0, residue_constants.atom_order["CA"]]
+        c_term_C = binder_xyz[-1, residue_constants.atom_order["C"]]
+        c_term_CA = binder_xyz[-1, residue_constants.atom_order["CA"]]
+
+        # 1. Bond length loss
+        bond_length = jnp.linalg.norm(c_term_C - n_term_N)
+        length_loss = jnp.square(bond_length - ideal_bond_length)
+
+        # 2. Bond angle 1 (CA-C-N)
+        v1 = c_term_CA - c_term_C
+        v2 = n_term_N - c_term_C
+        angle1_rad = jnp.arccos(jnp.dot(v1, v2) / (jnp.linalg.norm(v1) * jnp.linalg.norm(v2) + 1e-7))
+        angle1_deg = jnp.rad2deg(angle1_rad)
+        angle1_loss = jnp.square(angle1_deg - ideal_angle_ca_c_n)
+
+        # 3. Bond angle 2 (C-N-CA)
+        v3 = c_term_C - n_term_N
+        v4 = n_term_CA - n_term_N
+        angle2_rad = jnp.arccos(jnp.dot(v3, v4) / (jnp.linalg.norm(v3) * jnp.linalg.norm(v4) + 1e-7))
+        angle2_deg = jnp.rad2deg(angle2_rad)
+        angle2_loss = jnp.square(angle2_deg - ideal_angle_c_n_ca)
+
+        # 4. Dihedral angle (CA-C-N-CA)
+        p0, p1, p2, p3 = c_term_CA, c_term_C, n_term_N, n_term_CA
+        b0 = -1.0 * (p1 - p0)
+        b1 = p2 - p1
+        b2 = p3 - p2
+        b1_norm = b1 / (jnp.linalg.norm(b1) + 1e-7)
+        v = b0 - jnp.dot(b0, b1_norm) * b1_norm
+        w = b2 - jnp.dot(b2, b1_norm) * b1_norm
+        x = jnp.dot(v, w)
+        y = jnp.dot(jnp.cross(b1_norm, v), w)
+        dihedral_rad = jnp.arctan2(y, x)
+        dihedral_deg = jnp.rad2deg(dihedral_rad)
+
+        # Dihedral loss (handle periodicity)
+        dihedral_diff = dihedral_deg - ideal_dihedral
+        dihedral_loss = jnp.square(jnp.mod(dihedral_diff + 180, 360) - 180)
+
+        # Total loss (with scaling for angles/dihedrals)
+        total_loss = length_loss + 0.005 * (angle1_loss + angle2_loss) + 0.005 * dihedral_loss
+
+        return {"cyclization": total_loss}
+
+    self._callbacks["model"]["loss"].append(loss_fn)
+    self.opt["weights"]["cyclization"] = weight
 
 # plot design trajectory losses
 def plot_trajectory(af_model, design_name, design_paths):
